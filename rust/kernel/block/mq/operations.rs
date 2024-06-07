@@ -16,6 +16,7 @@ use core::{marker::PhantomData, ptr::NonNull};
 use super::TagSet;
 
 type ForeignBorrowed<'a, T> = <T as ForeignOwnable>::Borrowed<'a>;
+type ForeignBorrowedMut<'a, T> = <T as ForeignOwnable>::BorrowedMut<'a>;
 
 /// Implement this trait to interface blk-mq as block devices.
 ///
@@ -57,7 +58,7 @@ pub trait Operations: Sized {
     /// `false`, the driver is allowed to defer commiting the request.
     fn queue_rq(
         hw_data: ForeignBorrowed<'_, Self::HwData>,
-        queue_data: ForeignBorrowed<'_, Self::QueueData>,
+        queue_data: ForeignBorrowedMut<'_, Self::QueueData>,
         rq: ARef<Request<Self>>,
         is_last: bool,
     ) -> Result;
@@ -147,7 +148,7 @@ impl<T: Operations> OperationsVTable<T> {
         // call to `ForeignOwnable::into_pointer()` to create `queuedata`.
         // `ForeignOwnable::from_foreign()` is only called when the tagset is
         // dropped, which happens after we are dropped.
-        let queue_data = unsafe { T::QueueData::borrow(queue_data) };
+        let queue_data = unsafe { T::QueueData::borrow_mut(queue_data) };
 
         let ret = T::queue_rq(
             hw_data,

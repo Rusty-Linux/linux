@@ -58,6 +58,59 @@ pub struct XArray<T: ForeignOwnable> {
     _p: PhantomData<T>,
 }
 
+/// Definitions for the .entry() method of an XArray.
+/// Usage xarray.entry(key).or_insert(value);
+/// An entry can either be vacant or occupied.
+pub struct OccupiedEntry<'a, T: ForeignOwnable> { 
+    array: &'a XArray<T>,
+    value: NonNull<T>,
+}
+
+impl<'a, T: ForeignOwnable> OccupiedEntry<'a, T> {
+    pub fn get_mut(&mut self) -> &mut NonNull<T> {
+        //unsafe { self.value.0.as_mut() }
+        &mut self.value
+    }
+}
+
+pub struct VacantEntry<'a, T: ForeignOwnable> { 
+    key: usize, 
+    array: &'a XArray<T>,
+}
+
+impl<'a, T: ForeignOwnable> VacantEntry<'a, T> {
+    pub fn insert(&mut self, value: T) -> Guard<'a, T>
+    {
+        // Insert and retrieve from the array
+        self.array.replace(self.key, value);
+
+        // SAFETY: unsafe_get_unlocked is never None if replace() succeeded
+        Guard(self.array.get_unlocked(self.key).unwrap(), self.array)
+    }
+}
+
+pub enum XArrayEntry<'a, T: ForeignOwnable> {
+    Occupied(OccupiedEntry<'a, T>),
+    Vacant(VacantEntry<'a, T>),
+}
+
+impl<'a, T: ForeignOwnable> XArrayEntry<'a, T>
+{
+    pub fn or_insert(&mut self, value: T) -> Guard<'a, T> {
+        match self {
+            XArrayEntry::Occupied(e) => Guard(*e.get_mut(), e.array),
+            XArrayEntry::Vacant(e) => e.insert(value),
+        }
+    }
+
+    pub fn is_none(&self) -> bool {
+        match self {
+            XArrayEntry::Occupied(_) => false,
+            XArrayEntry::Vacant(_) => true,
+        }
+    }
+}
+
 /// Wrapper for a value owned by the `XArray` which holds the `XArray` lock until dropped.
 ///
 /// You can use the `into_foreign` method to obtain a pointer to the foreign
@@ -225,7 +278,7 @@ impl<T: ForeignOwnable> XArray<T> {
     }
 
     /// Replaces an entry with a new value, returning the old value (if any).
-    pub fn replace(&self, index: usize, value: T) -> Result<Option<T>> {
+    pub(self) fn replace(&self, index: usize, value: T) -> Result<Option<T>> {
         let new = value.into_foreign();
 
         build_assert!(T::FOREIGN_ALIGN >= 4);
@@ -263,7 +316,7 @@ impl<T: ForeignOwnable> XArray<T> {
     }
 
     /// Replaces an entry with a new value, dropping the old value (if any).
-    pub fn set(&self, index: usize, value: T) -> Result {
+    pub fn set(&mut self, index: usize, value: T) -> Result {
         self.replace(index, value)?;
         Ok(())
     }
@@ -274,9 +327,8 @@ impl<T: ForeignOwnable> XArray<T> {
     /// This guard blocks all other actions on the `XArray`. Callers are expected to drop the
     /// `Guard` eagerly to avoid blocking other users, such as by taking a clone of the value.
     pub fn get_locked(&self, index: usize) -> Option<Guard<'_, T>> {
-        // SAFETY: `self.xa` is always valid by the type invariant.
         unsafe { bindings::xa_lock(self.xa.get()) };
-
+ 
         // SAFETY: `self.xa` is always valid by the type invariant.
         let guard = ScopeGuard::new(|| unsafe { bindings::xa_unlock(self.xa.get()) });
 
@@ -287,13 +339,44 @@ impl<T: ForeignOwnable> XArray<T> {
         // is okay here, since the returned `Guard` ensures that the pointer can
         // only be used while the lock is still held.
         let p = unsafe { bindings::xa_load(self.xa.get(), Self::to_index(index)) };
-
         let p = NonNull::new(p.cast::<T>())?;
         guard.dismiss();
 
         // INVARIANT: We just dismissed the `guard`, so we can pass ownership of
         // the lock to the returned `Guard`.
         Some(Guard(p, self))
+    }
+
+    pub fn entry(&mut self, index: usize) -> XArrayEntry<'_, T> {
+        // SAFETY: `self.xa` is always valid by the type invariant.
+        unsafe { bindings::xa_lock(self.xa.get()) };
+
+        // SAFETY: `self.xa` is always valid by the type invariant.
+        //
+        // We currently hold the xa_lock, which is allowed by xa_load. The
+        // returned pointer `p` is only valid until we release the lock, which
+        // is okay here, since the returned `Guard` ensures that the pointer can
+        // only be used while the lock is still held.
+        let p = unsafe { bindings::xa_load(self.xa.get(), Self::to_index(index)) };
+
+        let p = NonNull::new(p.cast::<T>());
+        if p.is_none() {
+            return XArrayEntry::Vacant(VacantEntry {
+                key: index,
+                array: self,
+            });
+        } else {
+            return XArrayEntry::Occupied(OccupiedEntry {
+                array: self,
+                value: p.unwrap(),
+            });
+        }
+    }
+
+    pub(self) fn get_unlocked(&self, index: usize) -> Option<NonNull<T>> {
+        let p = unsafe { bindings::xa_load(self.xa.get(), Self::to_index(index)) };
+        let p = NonNull::new(p.cast::<T>());
+        p
     }
 
     /// Removes and returns an entry, returning it if it existed.

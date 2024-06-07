@@ -15,7 +15,9 @@
 //! `param_completion_time_nsec!.
 
 use core::ops::Deref;
+use core::ops::DerefMut;
 
+use kernel::xarray::Guard;
 use kernel::{
     bindings,
     block::{
@@ -147,6 +149,7 @@ struct NullBlkDevice;
 
 type Tree = XArray<Box<UniqueFolio>>;
 type TreeRef<'a> = &'a Tree;
+type TreeMutRef<'a> = &'a mut Tree;
 
 #[pin_data]
 struct TreeContainer {
@@ -194,16 +197,10 @@ struct QueueData {
 
 impl NullBlkDevice {
     #[inline(always)]
-    fn write(tree: TreeRef<'_>, sector: usize, segment: &Segment<'_>) -> Result {
+    fn write(tree: TreeMutRef<'_>, sector: usize, segment: &Segment<'_>) -> Result {
         let idx = sector >> bindings::PAGE_SECTORS_SHIFT;
 
-        let mut folio = if let Some(page) = tree.get_locked(idx) {
-            page
-        } else {
-            tree.set(idx, Box::try_new(Folio::try_new(0)?)?)?;
-            tree.get_locked(idx).unwrap()
-        };
-
+        let mut folio = tree.entry(idx).or_insert(Box::try_new(Folio::try_new(0)?)?);
         segment.copy_to_folio(&mut folio)?;
 
         Ok(())
@@ -223,7 +220,7 @@ impl NullBlkDevice {
     #[inline(never)]
     fn transfer(
         command: bindings::req_op,
-        tree: TreeRef<'_>,
+        tree: TreeMutRef<'_>,
         sector: usize,
         segment: &mut Segment<'_>,
     ) -> Result {
@@ -272,14 +269,14 @@ impl Operations for NullBlkDevice {
     #[inline(always)]
     fn queue_rq(
         _hw_data: (),
-        queue_data: &QueueData,
+        queue_data: &mut QueueData,
         rq: ARef<mq::Request<Self>>,
         _is_last: bool,
     ) -> Result {
         rq.start();
         if queue_data.memory_backed {
             let guard = queue_data.tree.lock.lock();
-            let tree = queue_data.tree.tree.deref();
+            let tree = queue_data.tree.tree.deref_mut();
 
             let mut sector = rq.sector();
             for bio in rq.bio_iter() {
